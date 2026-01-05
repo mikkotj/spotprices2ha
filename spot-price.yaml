@@ -1,5 +1,13 @@
+# Updated 2026-01-05 Mikko Jylhä
+# Numerous fixes
+# Recorder warnings (16384 bytes) not fixed. Architectural problem
+# Problem is that attributes are too long lists.
+# This can be partially fixed by recorder excludes
+# Then creating clean versions of shf entities - without long attributes, and using
+# them in templates.
+
 # Start pack for Spot Price control.
-# Version 0.2.5.1
+# Version 0.2.5.1B
 #
 # This is a copy-paste approach in order to get Finnish Electricity Spot Prices to Home Assistant.
 # Initial implementation by Temez but feel free to further develop this.
@@ -61,14 +69,42 @@ template:
       unit_of_measurement: Rank
       availability: '{{ state_attr("sensor.shf_data", "data") | selectattr("Timestamp", "le", now() | as_timestamp) | list | length > 0 }}'
       state: >
-          {{ (state_attr("sensor.shf_data", "data") | selectattr("Timestamp", "le", now() | as_timestamp) | list | last | default(none))["Rank"] | default(none) }}
+          {% set past = state_attr("sensor.shf_data", "data")
+             | selectattr("Timestamp", "le", now() | as_timestamp)
+             | list %}
+          {{ past[-1]["Rank"] if past | length > 0 else none }}
+      #
+      # FIX 2026-01-05 MikkoJ
+      #
+      # Problem - if  last | default(none) --> none["Rank"] --> → Template warning (not crashing, but to log)
+      # {{ (state_attr("sensor.shf_data", "data") | selectattr("Timestamp", "le", now() | as_timestamp) | list | last | default(none))["Rank"] | default(none) }}
   - sensor:
     - name: SHF Electricity price now
       unique_id: shf_electricity_price_now
       unit_of_measurement: &energy_price_unit €/kWh # Change this to c/kWh if you prefer cents
       device_class: monetary
-      state: '{{ (state_attr("sensor.shf_data", "data") | selectattr("Timestamp", "lt", now() | as_timestamp) | list)[-1]["TotalPrice"] | round(4) }}'
-      availability: '{{ state_attr("sensor.shf_data", "data") | selectattr("Timestamp", "ge", now() | as_timestamp ) | list | length > 0 }}'
+      # FIX 2026-01-05 MikkoJ
+      # Pituustarkistus ennen indeksointia puuttuu. Jos lista tyhjä --> error
+      # Laukeaa HA restartissa, vuorokauden vaihteessa, API-viiveessä, 15min rajalle
+      #state: '{{ (state_attr("sensor.shf_data", "data") | selectattr("Timestamp", "lt", now() | as_timestamp) | list)[-1]["TotalPrice"] | round(4) }}'
+      # Korjaus alla:
+      state: >
+        {% set past = state_attr("sensor.shf_data", "data") 
+          | selectattr("Timestamp", "lt", now() 
+          | as_timestamp) | list %}
+        {% if past | length > 0 %}
+          {{ past[-1]["TotalPrice"] | round(4) }}
+        {% else %}
+          none
+        {% endif %}
+      # availability käyttää Timestamp >= now(), mikä ei vastaa state-logiikkaa  
+      # availability: '{{ state_attr("sensor.shf_data", "data") | selectattr("Timestamp", "ge", now() | as_timestamp ) | list | length > 0 }}'
+      # FIX 2026-01-05 MikkoJ
+      # Korjaus alla:
+      availability: >
+        {{ state_attr("sensor.shf_data", "data")
+           | selectattr("Timestamp", "lt", now() | as_timestamp)
+           | list | length > 0 }}
       attributes:
         data: '{{ state_attr("sensor.shf_data", "data") }}'
         all_prices: '{{ state_attr("sensor.shf_data", "data") | selectattr("Timestamp", "ge", today_at("0:00") | as_timestamp) | map(attribute="TotalPrice") |list }}'
@@ -318,8 +354,27 @@ script:
                 {% set output.value = output.value + [d] %}
               {% endif %}
             {%- endfor -%}
-            {% set obj = (output.value | sort(attribute="PriceTmp"))[0] %}
-            {{ { "start" : obj["Timestamp"], "stop": obj["Timestamp"] + steps*900, "avgPrice": obj["PriceTmp"] } }}
+            {% set sorted = output.value | sort(attribute="PriceTmp") %}
+            {% set obj = sorted[0] if sorted | length > 0 else none %}
+            {% if obj %}
+              {{ {
+                "start": obj["Timestamp"],
+                "stop": obj["Timestamp"] + steps*900,
+                "avgPrice": obj["PriceTmp"]
+              } }}
+            {% else %}
+              {{ none }}
+            {% endif %}      
+      # ongelma 
+      # {% set obj = (output.value | sort(attribute="PriceTmp"))[0] %} 
+      # tästä voi nousta virhe
+      # KORJAUS
+      #{% set sorted = output.value | sort(attribute="PriceTmp") %}
+      #{% set obj = sorted[0] if sorted | length > 0 else none %}
+      # YLLÄ 2026-01-05 17:16  MIKKOJ
+      # MYÖS perässä ollut {{ { "start" : obj["Timestamp"], "stop": obj["Timestamp"] + steps*900, "avgPrice": obj["PriceTmp"] } }} on ongelmallinen
+      # Korjattu tuolla ir obj -rakenteella
+      # 
       - stop: Return variable
         response_variable: start_time
         enabled: true
@@ -347,8 +402,23 @@ script:
       - variables:
           data: >
             {% set data = state_attr("sensor.shf_data", "data") | selectattr("Timestamp", "ge", start | as_timestamp) | selectattr("Timestamp", "lt", stop | as_timestamp) | list %}
-            {% set avgPrice = data | sum(attribute="TotalPrice") / data | length %}
-            {{ { "start" : start, "stop": stop, "avgPrice": avgPrice } }}
+            {% set avgPrice = (data | sum(attribute="TotalPrice") / data | length)
+               if data | length > 0 else none %}
+            {{ {
+              "start": start,
+              "stop": stop,
+              "avgPrice": avgPrice
+            } if avgPrice is not none else none }}
+      #
+      # FIX 2026-01-05 MikkoJ
+      #
+      # Problem: {% set avgPrice = data | sum(attribute="TotalPrice") / data | length %}
+      #
+      # Can divide with 0
+      # Fixed with checking for value.
+      # 
+      # Also return fixed
+      
       - stop: Return variable
         response_variable: data
         enabled: true
